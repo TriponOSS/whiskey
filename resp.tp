@@ -1,0 +1,129 @@
+// whiskey/resp.tp - response writers.
+//
+// Everything is built into a Buf (ASCII bytes) and shipped through
+// wsk_send. Text responses take str literals; JSON escapes literal
+// payloads byte-by-byte. Dynamic numbers go through buf_put_i32.
+
+use tier core;
+
+// status text for the common codes; if-chain because there is no
+// match-expression in v0.
+fn whiskey_status_msg(status: i32) -> str {
+    if status == 200 { return "OK"; }
+    if status == 201 { return "Created"; }
+    if status == 204 { return "No Content"; }
+    if status == 301 { return "Moved Permanently"; }
+    if status == 400 { return "Bad Request"; }
+    if status == 403 { return "Forbidden"; }
+    if status == 404 { return "Not Found"; }
+    if status == 405 { return "Method Not Allowed"; }
+    if status == 409 { return "Conflict"; }
+    if status == 413 { return "Payload Too Large"; }
+    if status == 422 { return "Unprocessable Entity"; }
+    if status == 500 { return "Internal Server Error"; }
+    if status == 501 { return "Not Implemented"; }
+    if status == 503 { return "Service Unavailable"; }
+    return "OK";
+}
+
+// needs JSON escaping? quotes, backslash, control bytes only.
+fn js_escape_byte(c: i8) -> bool {
+    return c == cast<i8>(34) || c == cast<i8>(92) || c < cast<i8>(32);
+}
+
+// append `s` to `b` with JSON escaping applied to every byte.
+fn buf_put_json_str(b: Buf, s: str) -> Buf {
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        let c = cast<i8>(s[i]);
+        if c == cast<i8>(34) || c == cast<i8>(92) {
+            b = buf_put_byte(b, cast<i8>(92));
+            b = buf_put_byte(b, c);
+        } else if c < cast<i8>(32) {
+            // \u00XX
+            b = buf_put_str(b, "\\u00");
+            let hi = cast<i32>(c) / 16;
+            let lo = cast<i32>(c) % 16;
+            let e2: i8;
+            let e1: i8;
+            if hi < 10 {
+                e1 = cast<i8>(48 + hi);
+            } else {
+                e1 = cast<i8>(87 + hi);
+            }
+            if lo < 10 {
+                e2 = cast<i8>(48 + lo);
+            } else {
+                e2 = cast<i8>(87 + lo);
+            }
+            b = buf_put_byte(b, e1);
+            b = buf_put_byte(b, e2);
+        } else {
+            b = buf_put_byte(b, c);
+        }
+        i += 1;
+    }
+    return b;
+}
+
+// the one serializer: send `head` bytes to fd.
+fn whiskey_wire(fd: i32, head: Buf) -> result<i32, str> {
+    let r = wsk_send(fd, head);
+    if r < 0 {
+        return err("whiskey: write failed");
+    }
+    return ok(r);
+}
+
+// text/plain response with a literal body.
+fn whiskey_text(fd: i32, status: i32, body: str) -> result<i32, str> {
+    let out: Buf;
+    let n = len(body);
+    out = buf_put_str(out, "HTTP/1.1 ");
+    out = buf_put_i32(out, status);
+    out = buf_put_byte(out, cast<i8>(32));
+    out = buf_put_str(out, whiskey_status_msg(status));
+    out = buf_put_str(out, "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ");
+    out = buf_put_i32(out, n);
+    out = buf_put_str(out, "\r\nConnection: close\r\n\r\n");
+    out = buf_put_str(out, body);
+    return whiskey_wire(fd, out);
+}
+
+// exact escaped byte count of a literal, mirroring buf_put_json_str.
+fn json_escaped_len(s: str) -> i32 {
+    let n = len(s);
+    let i = 0;
+    let total = 0;
+    while i < n {
+        let c = cast<i8>(s[i]);
+        if c == cast<i8>(34) || c == cast<i8>(92) {
+            total += 2;
+        } else if c < cast<i8>(32) {
+            total += 6;
+        } else {
+            total += 1;
+        }
+        i += 1;
+    }
+    return total;
+}
+
+// JSON response, {"data":"<escaped literal>"} shape so v0 the helper is
+// safe for any wire client.
+fn whiskey_json(fd: i32, status: i32, body: str) -> result<i32, str> {
+    let out: Buf;
+    out = buf_put_str(out, "HTTP/1.1 ");
+    out = buf_put_i32(out, status);
+    out = buf_put_str(out, " ");
+    out = buf_put_str(out, whiskey_status_msg(status));
+    out = buf_put_str(out, "\r\nContent-Type: application/json\r\nContent-Length: ");
+    let jn = json_escaped_len(body) + 12;   // {"data":"..."} = 10 + 2
+    out = buf_put_i32(out, jn);
+    out = buf_put_str(out, "\r\nConnection: close\r\n\r\n{\"data\":\"");
+    out = buf_put_json_str(out, body);
+    out = buf_put_str(out, "\"}");
+    return whiskey_wire(fd, out);
+}
+

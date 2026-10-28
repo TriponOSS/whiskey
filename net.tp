@@ -1,0 +1,60 @@
+// whiskey/net.tp - TCP listener plumbing.
+//
+// The pointer-ful syscalls (socket/bind/listen/accept) live in glue.c; the
+// Tripon layer only ever sees scalar fds and Buf values.
+
+use tier core;
+
+extern "C" {
+    // glue.c: socket+bind+listen on 0.0.0.0:port, SOREUSEADDR on.
+    // returns the listening fd, or -1.
+    fn wsk_listen(port: i32) -> i32;
+    // glue.c: accept() on a listening fd, returns the conn fd or -1.
+    fn wsk_accept(lfd: i32) -> i32;
+    // glue.c: signal(SIGCHLD, SIG_IGN) once, so forked children are reaped
+    // by the kernel and never become zombies.
+    fn wsk_nozombies() -> i32;
+    // libc, scalar-safe.
+    fn close(fd: i32) -> i32;
+    // libc: 0 in the child, child pid in the parent. the fork-mode seam.
+    fn fork() -> i32;
+}
+
+// keep fork-per-request zombie-free: call once at startup, before accept.
+fn whiskey_nozombies() -> i32 {
+    return wsk_nozombies();
+}
+
+// open a listener; result so callers cannot ignore failure (E0205 forces it).
+fn whiskey_listen(port: i32) -> result<i32, str> {
+    let fd = wsk_listen(port);
+    if fd < 0 {
+        return err("whiskey: listen failed (port taken or privileged)");
+    }
+    return ok(fd);
+}
+
+// accept one connection.
+fn whiskey_accept(lfd: i32) -> result<i32, str> {
+    let cfd = wsk_accept(lfd);
+    if cfd < 0 {
+        return err("whiskey: accept failed");
+    }
+    return ok(cfd);
+}
+
+// drop a connection fd.
+fn whiskey_close(fd: i32) -> result<i32, str> {
+    let r = close(fd);
+    if r < 0 {
+        return err("whiskey: close failed");
+    }
+    return ok(r);
+}
+
+// fork-per-request mode: returns true when the current process is the child
+// that owns the connection (caller serves it then exits). The parent skips
+// to the next accept. 0 error cases, keep it an i32, 0/1.
+fn whiskey_is_child(pid: i32) -> bool {
+    return pid == 0;
+}

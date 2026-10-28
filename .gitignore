@@ -1,0 +1,6 @@
+build/
+*.o
+*.s
+a.out
+demo.log
+PLAN.md

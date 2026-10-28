@@ -1,0 +1,162 @@
+// whiskey/http.tp - HTTP/1.1 request line + headers + body parser.
+//
+// Input: one full request sitting in a Buf (glue.c already waited for the
+// complete headers and the body length). Output: Request value with method
+// + path span + body span. Zero pointers, zero slices: byte loops only.
+
+use tier core;
+
+// methods, from the wire, values are stable API (see route.tp for the
+// whiskey_method fns; v0 consts are niladic fns or nothing).
+struct Request {
+    method: i32;       // Method ordinal
+    pstart: i32;       // path bytes live at data[pstart .. pend)
+    pend: i32;
+    bstart: i32;       // body bytes live at data[bstart .. bstart+bn)
+    bn: i32;
+    data: Buf;
+}
+
+// header terminator "\r\n\r\n", present per glue contract.
+fn has_term(b: Buf) -> bool {
+    if b.n < 4 { return false; }
+    let i = 0;
+    while i + 3 < b.n {
+        if b.data[i] == cast<i8>(13) && b.data[i + 1] == cast<i8>(10)
+            && b.data[i + 2] == cast<i8>(13) && b.data[i + 3] == cast<i8>(10) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// method word: expects the world's four verbs, else Other.
+fn method_ord(b: Buf, i: i32) -> result<i32, str> {
+    if i + 4 <= b.n {
+        if b.data[i] == cast<i8>(71) && b.data[i + 1] == cast<i8>(69)
+            && b.data[i + 2] == cast<i8>(84) && b.data[i + 3] == cast<i8>(32) {
+            return ok(0);   // "GET "
+        }
+    }
+    if i + 5 <= b.n {
+        if b.data[i] == cast<i8>(80) && b.data[i + 1] == cast<i8>(79)
+            && b.data[i + 2] == cast<i8>(83) && b.data[i + 3] == cast<i8>(84)
+            && b.data[i + 4] == cast<i8>(32) {
+            return ok(1);   // "POST "
+        }
+        if b.data[i] == cast<i8>(80) && b.data[i + 1] == cast<i8>(85)
+            && b.data[i + 2] == cast<i8>(84) && b.data[i + 3] == cast<i8>(32) {
+            return ok(2);   // "PUT "
+        }
+    }
+    if i + 7 <= b.n {
+        if b.data[i] == cast<i8>(68) && b.data[i + 1] == cast<i8>(69)
+            && b.data[i + 2] == cast<i8>(76) && b.data[i + 3] == cast<i8>(69)
+            && b.data[i + 4] == cast<i8>(84) && b.data[i + 5] == cast<i8>(69)
+            && b.data[i + 6] == cast<i8>(32) {
+            return ok(3);   // "DELETE "
+        }
+    }
+    return err("unsupported method");
+}
+
+// one header value hunt: "name:" then spaces then value until CR.
+// case-insensitive over the wire bytes. some(vstart) or none.
+fn header_find(b: Buf, name: str) -> opt<i32> {
+    // "Content-Length" is the only one we need today, scan case-blind.
+    let nl = len(name);
+    let i = 0;
+    while i + nl + 2 < b.n {
+        if b.data[i] == cast<i8>(13) || b.data[i] == cast<i8>(10) {
+            let k = 0;
+            let at = i + 1;
+            let matched = true;
+            while k < nl {
+                if buf_lower(b.data[at + k]) != buf_lower(cast<i8>(name[k])) {
+                    matched = false;
+                    k = nl;
+                } else {
+                    k += 1;
+                }
+            }
+            if matched && at + nl < b.n && b.data[at + nl] == cast<i8>(58) {
+                // ':' then spaces
+                let v = at + nl + 1;
+                while v < b.n && b.data[v] == cast<i8>(32) {
+                    v += 1;
+                }
+                return some(v);
+            }
+        }
+        i += 1;
+    }
+    return none;
+}
+
+// parse a full request. err(status-code-ish message) forces the caller to
+// respond 400-style (E0205 keeps it honest).
+fn whiskey_parse(b: Buf) -> result<Request, str> {
+    if !has_term(b) {
+        return err("incomplete request");
+    }
+    let m = method_ord(b, 0);
+    let mval = 0;
+    match m {
+        ok(v)  => { mval = v; }
+        err(e) => { return err(e); }
+    }
+    // path: after method word up to the next space
+    let pstart = 4;
+    if mval != 0 { pstart = 5; }
+    if mval == 3 { pstart = 7; }
+    if pstart >= b.n || b.data[pstart] != cast<i8>(47) {
+        return err("bad request line");
+    }
+    let pend = pstart;
+    while pend < b.n && b.data[pend] != cast<i8>(32) && b.data[pend] != cast<i8>(13) {
+        pend += 1;
+    }
+    if pend >= b.n {
+        return err("bad request line");
+    }
+    // content-length, optional
+    let cl = 0;
+    let hdr = header_find(b, "content-length");
+    match hdr {
+        some(vlen) => {
+            let j = vlen;
+            while j < b.n && b.data[j] >= cast<i8>(48) && b.data[j] <= cast<i8>(57) {
+                cl = cl * 10 + cast<i32>(b.data[j] - cast<i8>(48));
+                j += 1;
+            }
+        }
+        none => { }
+    }
+    // body start: after "\r\n\r\n"
+    let bstart = 0;
+    let i = 0;
+    while i + 3 < b.n {
+        if b.data[i] == cast<i8>(13) && b.data[i + 1] == cast<i8>(10)
+            && b.data[i + 2] == cast<i8>(13) && b.data[i + 3] == cast<i8>(10) {
+            bstart = i + 4;
+            i = b.n;
+        } else {
+            i += 1;
+        }
+    }
+    if bstart + cl > b.n {
+        return err("truncated body");
+    }
+    if cl > 6000 {
+        return err("body too large");
+    }
+    let req: Request;
+    req.method = mval;
+    req.pstart = pstart;
+    req.pend = pend;
+    req.bstart = bstart;
+    req.bn = cl;
+    req.data = b;
+    return ok(req);
+}

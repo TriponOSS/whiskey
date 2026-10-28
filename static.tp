@@ -1,0 +1,45 @@
+// whiskey/static.tp - file serving wrapper.
+//
+// Path bytes flow out through the Buf-by-value channel to glue.c, which
+// owns open/read/stream and the traversal/absolute-path/DIR guards. The
+// serving root is the server process's CWD.
+
+use tier core;
+
+extern "C" {
+    // glue.c: 0 ok, 1 not found, 2 forbidden.
+    fn wsk_serve_file(fd: i32, path: Buf) -> i32;
+}
+
+// serve the request path as a file under CWD. the leading '/' is stripped
+// (glue refuses absolute paths anyway) and ".."-segments are refused.
+fn whiskey_static(fd: i32, req: Request) -> result<i32, str> {
+    let path: Buf;
+    let i = req.pstart + 1;   // past the root slash
+    while i < req.pend && path.n < 8190 {
+        path.data[path.n] = req.data.data[i];
+        path.n += 1;
+        i += 1;
+    }
+    // cut the query string: stop at first '?'
+    let j = 0;
+    while j < path.n {
+        if path.data[j] == cast<i8>(63) {
+            path.n = j;
+            j = path.n;
+        } else {
+            j += 1;
+        }
+    }
+    if path.n <= 0 {
+        return err("not-found");
+    }
+    let r = wsk_serve_file(fd, path);
+    if r == 0 {
+        return ok(0);
+    }
+    if r == 1 {
+        return err("not-found");
+    }
+    return err("forbidden");
+}

@@ -1,0 +1,173 @@
+// whiskey/demo - the demo server: every feature live.
+//
+// serve:  make serve  (or:  ./serve.sh)
+// routes:
+//   GET  /health        -> text 200
+//   GET  /json          -> json 200 (escaped payload)
+//   GET  /users/:id     -> text 200, id parsed from :param
+//   GET  /static/*      -> file under examples/public (traversal-proof)
+//   POST /echo          -> echoes the body back
+//   anything else       -> text 404
+//
+// fork-per-request: fresh process per connection, zombies reaped via
+// glue's signal(SIGCHLD, SIG_IGN).
+
+use tier core;
+
+// response helpers for the demo: results must be consumed (E0205), so every
+// send collapses to a plain i32.
+fn send_text(cfd: i32, status: i32, body: str) -> i32 {
+    let r = whiskey_text(cfd, status, body);
+    match r {
+        ok(_n)  => { return 0; }
+        err(_e) => { return -1; }
+    }
+}
+
+fn send_json(cfd: i32, status: i32, body: str) -> i32 {
+    let r = whiskey_json(cfd, status, body);
+    match r {
+        ok(_n)  => { return 0; }
+        err(_e) => { return -1; }
+    }
+}
+
+// POST /echo: copy raw body bytes straight back.
+fn echo_body(cfd: i32, req: Request) -> i32 {
+    let out: Buf;
+    let head: Buf;
+    head = buf_put_str(head, "HTTP/1.1 200 OK\r\nContent-Length: ");
+    head = buf_put_i32(head, req.bn);
+    head = buf_put_str(head, "\r\nConnection: close\r\n\r\n");
+    // head + body into one wire buffer
+    let wi = 0;
+    while wi < head.n {
+        out.data[wi] = head.data[wi];
+        wi += 1;
+    }
+    let bi = 0;
+    while bi < req.bn {
+        out.data[wi + bi] = req.data.data[req.bstart + bi];
+        bi += 1;
+    }
+    out.n = wi + bi;
+    let r = whiskey_send_buf(cfd, out);
+    match r {
+        ok(_n)  => { return 0; }
+        err(_e) => { return -1; }
+    }
+}
+
+fn dispatch(cfd: i32, req: Request) -> i32 {
+    if whiskey_method_is(req, whiskey_get()) {
+        let mh = whiskey_route(req, "/health");
+        match mh {
+            some(_m) => { return send_text(cfd, 200, "whiskey: ok\n"); }
+            none     => { }
+        }
+        let mj = whiskey_route(req, "/json");
+        match mj {
+            some(_m) => { return send_json(cfd, 200, "hello \"whiskey\""); }
+            none     => { }
+        }
+        let mu = whiskey_route(req, "/users/:id");
+        match mu {
+            some(m) => {
+                let idm = whiskey_param_i32(req, m, 0);
+                match idm {
+                    some(id) => { return send_text(cfd, 200, "user id looks safe (i32-checked)\n"); }
+                    none     => { return send_text(cfd, 400, "param is not an i32\n"); }
+                }
+            }
+            none     => { }
+        }
+        let ms = whiskey_route(req, "/static/:file");
+        match ms {
+            some(_m) => {
+                let rs = whiskey_static(cfd, req);
+                match rs {
+                    ok(_n)  => { return 0; }
+                    err(e2) => {
+                        if e2 == "not-found" {
+                            return send_text(cfd, 404, "no file\n");
+                        }
+                        return send_text(cfd, 403, "forbidden path\n");
+                    }
+                }
+            }
+            none     => { }
+        }
+    } else if whiskey_method_is(req, whiskey_post()) {
+        let me = whiskey_route(req, "/echo");
+        match me {
+            some(_m) => { return echo_body(cfd, req); }
+            none     => { }
+        }
+    } else {
+        return send_text(cfd, 405, "method not allowed\n");
+    }
+    return send_text(cfd, 404, "not found\n");
+}
+
+fn handle_buf(cfd: i32, b: Buf) -> i32 {
+    let rp = whiskey_parse(b);
+    match rp {
+        err(e)  => { return send_text(cfd, 400, e); }
+        ok(req) => { return dispatch(cfd, req); }
+    }
+}
+
+// one connection, from the wire in to the wire out.
+fn handle_conn(cfd: i32) -> i32 {
+    let rb = whiskey_recv(cfd);
+    match rb {
+        err(_e) => { return 0; }        // early close: nothing to answer
+        ok(b)   => { return handle_buf(cfd, b); }
+    }
+}
+
+fn main() -> i32 {
+    let lg = whiskey_listen(8080);
+    let lfd = 0;
+    match lg {
+        ok(fd)  => { lfd = fd; }
+        err(e)  => {
+            print_str(e);
+            print_str("\n");
+            return 1;
+        }
+    }
+    whiskey_nozombies();   // fork-mode zombie reap
+    print_str("whiskey demo: 0.0.0.0:8080 fork-per-request\n");
+    let run = true;
+    while run {
+        let acc = whiskey_accept(lfd);
+        let cfd = 0;
+        match acc {
+            ok(fd) => { cfd = fd; }
+            err(_e) => {
+                print_str("whiskey: accept failed, stopping\n");
+                run = false;
+            }
+        }
+        if run {
+            let pid = fork();
+            if pid == 0 {
+                // child: own the connection, then die quietly
+                let ignored = handle_conn(cfd);
+                return 0;
+            } else if pid > 0 {
+                // parent: conn belongs to the child now
+                let pc = whiskey_close(cfd);
+                match pc {
+                    ok(_n)  => { }
+                    err(_e) => { }
+                }
+            } else {
+                print_str("whiskey: fork failed, stopping\n");
+                run = false;
+            }
+        }
+    }
+    return 0;
+}

@@ -1,0 +1,107 @@
+// whiskey/io.tp - the byte-wire layer.
+//
+// Tripon v0 has no pointers outside extern islands and arrays cannot cross
+// fn boundaries, so the wire flows through one struct-by-value ABI shape:
+//
+//   struct Buf { n: i32; data: [8192]i8; }
+//
+// glue.c (shipped with whiskey) implements wsk_recv/wsk_send against this
+// exact layout.  Everything higher-level in whiskey reads/writes Buf.
+
+struct Buf {
+    n: i32;
+    data: [8192]i8;
+}
+
+extern "C" {
+    // glue.c: read one full HTTP request (headers + body) from fd.
+    fn wsk_recv(fd: i32) -> Buf;
+    // glue.c: write buf's first n bytes to fd.
+    fn wsk_send(fd: i32, buf: Buf) -> i32;
+}
+
+// one shared empty-ish buffer value,Buf has no init-list syntax in v0,
+// locals zero-initialize per the no-UB contract.
+fn buf_new() -> Buf {
+    let b: Buf;
+    return b;
+}
+
+// copy a str literal's bytes into buf, return buf (functional style: Buf
+// crosses fn boundaries by value, so mutation happens on the returned value).
+fn buf_put_str(b: Buf, s: str) -> Buf {
+    let i = 0;
+    let n = len(s);
+    while i < n && b.n + i < 8192 {
+        b.data[b.n + i] = cast<i8>(s[i]);
+        i += 1;
+    }
+    b.n = b.n + i;
+    return b;
+}
+
+// append one byte (kept private-ish: prefixed anyway, one namespace today).
+fn buf_put_byte(b: Buf, c: i8) -> Buf {
+    if b.n < 8192 {
+        b.data[b.n] = c;
+        b.n = b.n + 1;
+    }
+    return b;
+}
+
+// append a decimal i32, plain digits, sign for negatives.
+fn buf_put_i32(b: Buf, v: i32) -> Buf {
+    let x = v;
+    if x < 0 {
+        b.data[b.n] = cast<i8>(45);      // '-'
+        b.n = b.n + 1;
+        x = 0 - x;
+    }
+    // digits, most-significant first; at least one
+    let start = b.n;
+    if x == 0 {
+        b.data[b.n] = cast<i8>(48);      // '0'
+        b.n = b.n + 1;
+    }
+    let rest = x;
+    let rev: [12]i8;
+    let i = 0;
+    while rest > 0 && i < 12 {
+        rev[i] = cast<i8>(48 + rest % 10);
+        rest = (rest - rest % 10) / 10;
+        i += 1;
+    }
+    let k = i - 1;
+    while k >= 0 {
+        b.data[b.n] = rev[k];
+        b.n = b.n + 1;
+        k -= 1;
+    }
+    return b;
+}
+
+// read one full request from a connection fd. err = early close.
+fn whiskey_recv(fd: i32) -> result<Buf, str> {
+    let b = wsk_recv(fd);
+    if b.n <= 0 {
+        return err("whiskey: connection closed");
+    }
+    return ok(b);
+}
+
+// write a prebuilt Buf to a connection fd.
+fn whiskey_send_buf(fd: i32, b: Buf) -> result<i32, str> {
+    let r = wsk_send(fd, b);
+    if r < 0 {
+        return err("whiskey: write failed");
+    }
+    return ok(r);
+}
+
+// ascii-lowercase one byte in place (byte-level, c-is-safe).
+fn buf_lower(c: i8) -> i8 {
+    if c >= 65 && c <= 90 {
+        return cast<i8>(c + 32);
+    }
+    return c;
+}
